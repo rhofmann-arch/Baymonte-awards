@@ -352,7 +352,10 @@ textarea { resize:vertical;line-height:1.75;font-size:14px; }
         <div class="total-words">Total: <span id="totalWords" style="color:rgba(212,175,55,0.7)">0</span> words</div>
         <div class="error-box" id="discError" style="display:none"></div>
         <button class="btn-save-draft" onclick="saveDraft()">💾 Save Draft &amp; Return to Roster</button>
-        <button class="btn-primary" id="btnGenerate" onclick="generateAward()" disabled>Generate Award Text ✨</button>
+        <div style="display:flex;gap:10px;">
+          <button class="btn-primary" id="btnGenerate" onclick="generateAward('faculty')" disabled style="flex:1">Generate Award ✨</button>
+          <button class="btn-primary" id="btnGeneratePeer" onclick="generateAward('peer')" disabled style="flex:1;background:linear-gradient(135deg,#7c5cbf,#5c3d9e)">Generate Peer Award 👥</button>
+        </div>
       </div>
 
       <!-- STEP 3 -->
@@ -368,7 +371,7 @@ textarea { resize:vertical;line-height:1.75;font-size:14px; }
       <div id="step-result" style="display:none">
         <div class="meta-row">
           <div>
-            <h2 class="sec-title" style="margin-bottom:4px">Award Ready</h2>
+            <h2 class="sec-title" style="margin-bottom:4px" id="resultTitle">Award Ready</h2>
             <p class="meta-info" id="resultMeta"></p>
           </div>
         </div>
@@ -472,6 +475,22 @@ Given one or more faculty discussion transcripts about a student, extract key ac
   * Includes a relevant Bible verse that naturally reinforces the character trait(s) highlighted
   * Is written in third person (e.g., "Ava is..." not "You are...")
   * Ends on an encouraging, forward-looking note
+
+Return ONLY valid JSON. No markdown, no code fences, no extra text.`;
+
+const PEER_SYSTEM_PROMPT = `You are an assistant helping a Christian school (Baymonte Christian School) write peer character award descriptions for students.
+
+You will be given notes or discussion transcripts about a student. Synthesize them into a single, polished first-person peer award written as if one peer is speaking — warm, genuine, and conversational.
+
+Return a JSON object with exactly two fields:
+- "title": A short award title of 1-3 words. Examples: "Loyal Friend", "Joyful Spirit", "Encourager".
+- "text": A peer award that:
+  * Is 80-120 words (target ~100)
+  * Uses first-person peer voice: "I know I can count on…", "I'll never forget…", "One time…", "[Name] makes our class better by…"
+  * Opens with a general character statement, then includes at least one specific memory or anecdote
+  * Feels natural and conversational, not formal
+  * Does NOT include a Bible verse UNLESS one is specifically mentioned in the notes
+  * Ends on a warm, forward-looking note
 
 Return ONLY valid JSON. No markdown, no code fences, no extra text.`;
 
@@ -811,7 +830,7 @@ function openStudent(sid) {
     genStep("result");
     document.getElementById("awardTitle").value = student.awardTitle || "";
     document.getElementById("awardText").value = student.awardText;
-    updateResultMeta(student.name, student.awardText);
+    updateResultMeta(student.name, student.awardText, false);
     document.getElementById("restoreBtn").style.display = "none";
   } else if (student.status === "prog") {
     document.getElementById("nameDisplay").textContent = student.name;
@@ -911,7 +930,9 @@ function updateTotalWords() {
 }
 
 function updateGenerateBtn() {
-  document.getElementById("btnGenerate").disabled=!recordings.some(r=>r.transcript.trim());
+  const has=recordings.some(r=>r.transcript.trim());
+  document.getElementById("btnGenerate").disabled=!has;
+  const p=document.getElementById("btnGeneratePeer"); if(p) p.disabled=!has;
 }
 
 const micSVG=`<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="23"/><line x1="8" y1="23" x2="16" y2="23"/></svg>`;
@@ -1051,7 +1072,9 @@ async function requestMic(ctx){
 // ═══════════════════════════════════════════════
 // GENERATE
 // ═══════════════════════════════════════════════
-async function generateAward(){
+async function generateAward(mode){
+  mode = mode || 'faculty';
+  const isPeer = mode === 'peer';
   const name=document.getElementById("studentName").value.trim();
   const combined=recordings
     .map(r=>recordings.length>1?`[${r.label}]\n${r.transcript.trim()}`:r.transcript.trim())
@@ -1065,15 +1088,19 @@ async function generateAward(){
   if(s){s.status="prog";s.recordings=recordings.map(r=>({...r}));saveState();}
 
   document.getElementById("processingMsg").textContent=
-    `Reviewing ${recordings.length>1?recordings.length+" recordings":"discussion"} for ${name}…`;
+    `${isPeer?"Synthesizing peer notes":"Reviewing discussion"} for ${name}…`;
   genStep("processing");
 
   try{
     const res=await fetch(API_URL,{
       method:"POST",
       headers:{"Content-Type":"application/json","x-api-key":apiKey,"anthropic-version":"2023-06-01","anthropic-dangerous-direct-browser-access":"true"},
-      body:JSON.stringify({model:"claude-sonnet-4-20250514",max_tokens:1000,system:SYSTEM_PROMPT,
-        messages:[{role:"user",content:`Student Name: ${name}\n\nFaculty Discussion Transcripts:\n${combined}\n\nPlease propose an award title and write the award description for ${name}.`}]}),
+      body:JSON.stringify({model:"claude-sonnet-4-20250514",max_tokens:1000,
+        system: isPeer ? PEER_SYSTEM_PROMPT : SYSTEM_PROMPT,
+        messages:[{role:"user",content: isPeer
+          ? `Student Name: ${name}\n\nNotes:\n${combined}\n\nPlease propose a title and write the peer award for ${name}.`
+          : `Student Name: ${name}\n\nFaculty Discussion Transcripts:\n${combined}\n\nPlease propose an award title and write the award description for ${name}.`
+        }]}),
     });
     const bodyText=await res.text();
     if(!bodyText.trim())throw new Error("Empty response (HTTP "+res.status+"). Check API key.");
@@ -1087,7 +1114,9 @@ async function generateAward(){
     document.getElementById("awardTitle").value=proposedTitle;
     document.getElementById("awardText").value=(parsed.text||"").trim();
     document.getElementById("restoreBtn").style.display="none";
-    updateResultMeta(name,parsed.text||"");
+    const rt=document.getElementById("resultTitle");
+    if(rt){rt.textContent=isPeer?"Peer Award Ready":"Award Ready";rt.style.color=isPeer?"#a78bda":"";}
+    updateResultMeta(name,parsed.text||"",isPeer);
     genStep("result");
   }catch(e){
     genStep("discussion");
@@ -1095,11 +1124,12 @@ async function generateAward(){
   }
 }
 
-function updateResultMeta(name,text){
+function updateResultMeta(name,text,isPeer){
   const wc=text.trim().split(/\s+/).filter(Boolean).length;
-  const good=wc>=100&&wc<=150;
+  const lo=isPeer?80:100, hi=isPeer?120:150;
+  const good=wc>=lo&&wc<=hi;
   document.getElementById("resultMeta").innerHTML=
-    `${escHtml(name)} · ${wc} words <span class="wc-badge ${good?"wc-good":"wc-bad"}">${good?"✓ Ideal length":wc<100?"Too short":"Too long"}</span>`;
+    `${escHtml(name)} · ${wc} words <span class="wc-badge ${good?"wc-good":"wc-bad"}">${good?"✓ Ideal length":wc<lo?"Too short":"Too long"}</span>`;
 }
 
 function checkRestoreBtn(){
@@ -1110,10 +1140,19 @@ function checkRestoreBtn(){
 }
 
 function restoreTitle(){document.getElementById("awardTitle").value=proposedTitle;document.getElementById("restoreBtn").style.display="none";}
-function regenerate(){proposedTitle="";genStep("discussion");renderRecordings();}
+function regenerate(){
+  proposedTitle="";
+  const rt=document.getElementById("resultTitle");
+  if(rt){rt.textContent="Award Ready";rt.style.color="";}
+  genStep("discussion");renderRecordings();
+}
 
 document.addEventListener("input",e=>{
-  if(e.target.id==="awardText")updateResultMeta(document.getElementById("studentName").value.trim(),e.target.value);
+  if(e.target.id==="awardText"){
+    const _rt=document.getElementById("resultTitle");
+    const _isPeer=_rt&&_rt.textContent==="Peer Award Ready";
+    updateResultMeta(document.getElementById("studentName").value.trim(),e.target.value,_isPeer);
+  }
   if(e.target.id==="awardTitle")checkRestoreBtn();
 });
 
