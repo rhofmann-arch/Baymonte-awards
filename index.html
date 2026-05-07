@@ -3,6 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
 <title>Character Award Generator — Baymonte Christian School</title>
 <style>
 * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -180,6 +181,10 @@ textarea { resize:vertical;line-height:1.75;font-size:14px; }
 .modal-btns .btn-primary { flex:1; }
 .modal-btns .btn-ghost { flex:1; }
 
+.sync-indicator { position:fixed;bottom:20px;right:20px;padding:8px 16px;border-radius:20px;font-size:12px;font-family:Georgia,serif;transition:all 0.3s;pointer-events:none;z-index:50; }
+.sync-saving { background:rgba(212,175,55,0.15);border:1px solid rgba(212,175,55,0.3);color:var(--gold); }
+.sync-saved  { background:rgba(34,197,94,0.15);border:1px solid rgba(34,197,94,0.3);color:#86efac; }
+.sync-error  { background:rgba(239,68,68,0.15);border:1px solid rgba(239,68,68,0.3);color:#fca5a5; }
 @keyframes spin { to{transform:rotate(360deg);} }
 @keyframes pulse { 0%,100%{opacity:1;}50%{opacity:0.2;} }
 @keyframes fadeIn { from{opacity:0;transform:translateY(6px);}to{opacity:1;transform:translateY(0);} }
@@ -191,6 +196,7 @@ textarea { resize:vertical;line-height:1.75;font-size:14px; }
 <body>
 <div class="bg-grid"></div>
 <div class="bg-glow"></div>
+<div class="sync-indicator" id="syncIndicator" style="display:none"></div>
 
 <div class="wrap">
 
@@ -463,6 +469,8 @@ textarea { resize:vertical;line-height:1.75;font-size:14px; }
 // ═══════════════════════════════════════════════
 const API_URL = "https://api.anthropic.com/v1/messages";
 const MAX_CLASSES = 8;
+const SUPABASE_URL  = "https://ikricuqrbnpyohvmwwjl.supabase.co";
+const SUPABASE_ANON = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImlrcmljdXFyYm5weW9odm13d2psIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzE2MjUzODksImV4cCI6MjA4NzIwMTM4OX0.WN2JxATc2L_cSMXd98reIt8A-9UNo9oXVj73JVlZH9M";
 const SYSTEM_PROMPT = `You are an assistant helping a Christian school (Baymonte Christian School) write character award descriptions for students.
 
 Given one or more faculty discussion transcripts about a student, extract key accolades, specific anecdotes, and character traits. Return a JSON object with exactly two fields:
@@ -497,6 +505,11 @@ Return a JSON object with exactly two fields:
 Return ONLY valid JSON. No markdown, no code fences, no extra text.`;
 
 // ═══════════════════════════════════════════════
+// SUPABASE CLIENT
+// ═══════════════════════════════════════════════
+const sb = supabase.createClient(SUPABASE_URL, SUPABASE_ANON);
+
+// ═══════════════════════════════════════════════
 // STATE
 // ═══════════════════════════════════════════════
 // classes: [{ id, name, students: [{id,name,status,awardTitle,awardText,recordings}] }]
@@ -522,29 +535,90 @@ const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
 if (!SR) micStatus = "unsupported";
 
 // ═══════════════════════════════════════════════
-// PERSISTENCE
+// PERSISTENCE — Supabase + localStorage fallback for apiKey
 // ═══════════════════════════════════════════════
-function saveState() {
-  try {
-    localStorage.setItem("bcs_classes", JSON.stringify(classes));
-    localStorage.setItem("bcs_apikey", apiKey);
-  } catch(e) {}
+function showSync(state, msg) {
+  const el = document.getElementById("syncIndicator");
+  if (!el) return;
+  el.className = "sync-indicator sync-" + state;
+  el.textContent = msg;
+  el.style.display = "";
+  if (state === "saved") setTimeout(() => el.style.display = "none", 2000);
 }
 
-function loadState() {
+async function loadState() {
+  // API key from localStorage only
   try {
-    const c = localStorage.getItem("bcs_classes");
-    if (c) classes = JSON.parse(c);
     const k = localStorage.getItem("bcs_apikey");
     if (k) apiKey = k;
   } catch(e) {}
+  // Classes + students from Supabase
+  try {
+    const { data: clsData, error: clsErr } = await sb.from("classes").select("*").order("created_at");
+    if (clsErr) throw clsErr;
+    const { data: stuData, error: stuErr } = await sb.from("students").select("*").order("name");
+    if (stuErr) throw stuErr;
+    classes = (clsData || []).map(cls => ({
+      id: cls.id,
+      name: cls.name,
+      students: (stuData || [])
+        .filter(s => s.class_id === cls.id)
+        .map(s => ({
+          id: s.id,
+          class_id: s.class_id,
+          name: s.name,
+          status: s.status || "none",
+          awardTitle: s.award_title || "",
+          awardText: s.award_text || "",
+          recordings: s.recordings || []
+        }))
+    }));
+  } catch(e) {
+    console.error("Supabase load error:", e);
+    showSync("error", "Load failed — check connection");
+  }
+}
+
+async function saveClass(cls) {
+  showSync("saving", "Saving…");
+  const { error } = await sb.from("classes").upsert({ id: cls.id, name: cls.name });
+  if (error) { showSync("error", "Save failed"); console.error(error); return false; }
+  showSync("saved", "✓ Saved");
+  return true;
+}
+
+async function saveStudent(student) {
+  showSync("saving", "Saving…");
+  const row = {
+    id:          student.id,
+    class_id:    student.class_id || currentClassId,
+    name:        student.name,
+    status:      student.status || "none",
+    award_title: student.awardTitle || "",
+    award_text:  student.awardText  || "",
+    recordings:  student.recordings || []
+  };
+  const { error } = await sb.from("students").upsert(row);
+  if (error) { showSync("error", "Save failed"); console.error(error); return false; }
+  showSync("saved", "✓ Saved");
+  return true;
+}
+
+async function saveState() {
+  // API key to localStorage only
+  try { localStorage.setItem("bcs_apikey", apiKey); } catch(e) {}
+}
+
+async function deleteClassDB(id) {
+  await sb.from("students").delete().eq("class_id", id);
+  await sb.from("classes").delete().eq("id", id);
 }
 
 // ═══════════════════════════════════════════════
 // INIT
 // ═══════════════════════════════════════════════
-function init() {
-  loadState();
+async function init() {
+  await loadState();
   // Check mic permission silently
   if (micStatus !== "unsupported") {
     navigator.permissions && navigator.permissions.query({name:"microphone"}).then(p => {
@@ -583,17 +657,21 @@ function updateSetupBtn() {
   document.getElementById("btnSetup").disabled = !(key.startsWith("sk-") && name);
 }
 
-function finishSetup() {
+async function finishSetup() {
   apiKey = document.getElementById("setupApiKey").value.trim();
+  await saveState();
   const name = document.getElementById("setupClassName").value.trim();
   const raw = document.getElementById("rosterPaste").value;
-  const newClass = {
-    id: Date.now(),
-    name,
-    students: parseRoster(raw, [])
-  };
-  classes.push(newClass);
-  saveState();
+  const newId = crypto.randomUUID();
+  const cls = { id: newId, name, students: [] };
+  classes.push(cls);
+  await saveClass(cls);
+  const newStudents = parseRoster(raw, []);
+  for (const s of newStudents) {
+    s.class_id = newId;
+    await saveStudent(s);
+  }
+  cls.students = newStudents;
   showView("classes");
 }
 
@@ -612,9 +690,9 @@ function updateSettingsBtn() {
   document.getElementById("btnSettingsSave").disabled = !key.startsWith("sk-");
 }
 
-function saveSettings() {
+async function saveSettings() {
   apiKey = document.getElementById("settingsApiKey").value.trim();
-  saveState();
+  await saveState();
   closeSettingsModal();
 }
 
@@ -657,7 +735,7 @@ function updateModalBtn() {
   document.getElementById("btnModalSave").disabled = !document.getElementById("modalClassName").value.trim();
 }
 
-function saveClassModal() {
+async function saveClassModal() {
   const name = document.getElementById("modalClassName").value.trim();
   const raw = document.getElementById("modalRosterPaste").value;
   if (!name) return;
@@ -666,13 +744,28 @@ function saveClassModal() {
     const cls = classes.find(c => String(c.id) === String(currentClassId));
     if (cls) {
       cls.name = name;
-      cls.students = parseRoster(raw, cls.students);
-      if (currentClassId === cls.id) document.getElementById("rosterClassName").textContent = name;
+      await saveClass(cls);
+      const newStudents = parseRoster(raw, cls.students);
+      const brandNew = newStudents.filter(s => !cls.students.find(e => e.id === s.id));
+      for (const s of brandNew) {
+        s.class_id = cls.id;
+        await saveStudent(s);
+        cls.students.push(s);
+      }
+      document.getElementById("rosterClassName").textContent = name;
     }
   } else {
-    classes.push({ id: Date.now(), name, students: parseRoster(raw, []) });
+    const newId = crypto.randomUUID();
+    const cls = { id: newId, name, students: [] };
+    classes.push(cls);
+    await saveClass(cls);
+    const newStudents = parseRoster(raw, []);
+    for (const s of newStudents) {
+      s.class_id = newId;
+      await saveStudent(s);
+    }
+    cls.students = newStudents;
   }
-  saveState();
   closeModal();
   const currentView = document.getElementById("view-roster").style.display !== "none" ? "roster" : "classes";
   showView(currentView);
@@ -682,12 +775,12 @@ function closeModal() {
   document.getElementById("classModal").style.display = "none";
 }
 
-function deleteClass(id) {
+async function deleteClass(id) {
   const cls = classes.find(c => String(c.id) === String(id));
   if (!cls) return;
   if (!confirm(`Delete "${cls.name}" and all its student data? This cannot be undone.`)) return;
+  await deleteClassDB(id);
   classes = classes.filter(c => String(c.id) !== String(id));
-  saveState();
   renderClassesGrid();
 }
 
@@ -887,20 +980,26 @@ function currentStudent() {
   return cls ? cls.students.find(s=>String(s.id)===String(currentStudentId)) : null;
 }
 
-function saveDraft() {
+async function saveDraft() {
   if (activeRecId !== null) stopRecording();
   const s = currentStudent();
-  if (s) { s.recordings=recordings.map(r=>({...r})); s.status="prog"; saveState(); }
+  if (s) {
+    s.recordings = recordings.map(r=>({...r}));
+    s.status = "prog";
+    s.class_id = currentClassId;
+    await saveStudent(s);
+  }
   showView("roster");
 }
 
-function markComplete() {
+async function markComplete() {
   const s = currentStudent();
   if (s) {
-    s.status="done";
-    s.awardTitle=document.getElementById("awardTitle").value.trim();
-    s.awardText=document.getElementById("awardText").value.trim();
-    saveState();
+    s.status = "done";
+    s.awardTitle = document.getElementById("awardTitle").value.trim();
+    s.awardText  = document.getElementById("awardText").value.trim();
+    s.class_id   = currentClassId;
+    await saveStudent(s);
   }
   showView("roster");
 }
@@ -1087,7 +1186,12 @@ async function generateAward(mode){
   if(activeRecId!==null)stopRecording();
 
   const s=currentStudent();
-  if(s){s.status="prog";s.recordings=recordings.map(r=>({...r}));saveState();}
+  if(s){
+    s.status="prog";
+    s.recordings=recordings.map(r=>({...r}));
+    s.class_id=currentClassId;
+    await saveStudent(s);
+  }
 
   document.getElementById("processingMsg").textContent=
     `${isPeer?"Synthesizing peer notes":"Reviewing discussion"} for ${name}…`;
@@ -1178,7 +1282,11 @@ function showDiscError(msg){const el=document.getElementById("discError");el.sty
 function escHtml(s){return String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;");}
 
 // BOOT
-init();
+(async () => {
+  // Load API key from localStorage immediately so setup screen pre-fills
+  try { const k = localStorage.getItem("bcs_apikey"); if (k) apiKey = k; } catch(e) {}
+  await init();
+})();
 </script>
 </body>
 </html>
